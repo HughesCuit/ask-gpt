@@ -233,7 +233,17 @@ async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR);
-      const meta = writeLockMeta(LOCK_DIR);
+      let meta;
+      try {
+        meta = writeLockMeta(LOCK_DIR);
+      } catch (err) {
+        try {
+          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        throw err;
+      }
       return () => releaseLockOwned(LOCK_DIR, meta.owner_token);
     } catch {
       if (lockIsStale(LOCK_DIR)) {
@@ -461,14 +471,20 @@ async function waitAndCaptureReply(page, timeout, { baselineHash = null } = {}) 
     }
 
     const isNewTurn = msgs.length > baseline || sawContent;
-    // Require hash change when a pre-send assistant message existed (avoid returning stale reply).
     if (isNewTurn && lastText && sawNewHash && !streaming && stable >= STABLE_TICKS) {
-      return { text: lastText, hash: lastHash || hashText(lastText) };
+      return { text: lastText, hash: lastHash || hashText(lastText), truncated: false };
     }
     await page.waitForTimeout(TICK_MS);
   }
+
+  // On timeout: only accept text if streaming has stopped and content looks stable.
+  const stillStreaming = await isStreaming(page);
+  if (lastText && (sawNewHash || !baselineHash) && !stillStreaming && stable >= 2) {
+    return { text: lastText, hash: lastHash || hashText(lastText), truncated: false };
+  }
   if (lastText && (sawNewHash || !baselineHash)) {
-    return { text: lastText, hash: lastHash || hashText(lastText) };
+    // Partial / possibly still streaming — flag as truncated, caller may still use it.
+    return { text: lastText, hash: lastHash || hashText(lastText), truncated: true };
   }
   return null;
 }
@@ -1166,10 +1182,29 @@ async function cmdAsk(argv) {
         sent = true;
       }).catch(() => {});
     }
+
+    // Confirm submit: composer cleared, streaming started, or assistant count increased.
+    if (sent) {
+      const preCount = preMsgs.length;
+      const deadline = Date.now() + 6_000;
+      let confirmed = false;
+      while (Date.now() < deadline) {
+        const composerNow = visibleText(await readComposerText(composer).catch(() => ''));
+        const streamingNow = await isStreaming(page);
+        const countNow = (await assistantMessages(page)).length;
+        if (!composerNow || streamingNow || countNow > preCount) {
+          confirmed = true;
+          break;
+        }
+        await page.waitForTimeout(250);
+      }
+      if (!confirmed) sent = false;
+    }
+
     if (!sent) {
       const debugDir = await saveDebugBundle(page, { code: 'SEND_ERROR', stage: 'send' });
       writeOutcome(
-        failResult('SEND_ERROR', 'Could not submit the message (click/Enter failed)', {
+        failResult('SEND_ERROR', 'Could not confirm message submit (composer/stream/count)', {
           stage: 'send',
           debug_dir: debugDir,
           retryable: true,
@@ -1213,6 +1248,7 @@ async function cmdAsk(argv) {
         request_id: requestId,
         prompt_fingerprint: promptFingerprint,
         reply_hash: reply.hash,
+        truncated: !!reply.truncated,
         duration_ms: durationMs,
         conversation: mode,
         conversation_id: convId,
