@@ -21,7 +21,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
 function readPkgVersion() {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8'));
+    const raw = fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8').replace(/^﻿/, '');
+    const pkg = JSON.parse(raw);
     return pkg.version || '0.0.0';
   } catch {
     return '0.0.0';
