@@ -39,6 +39,16 @@ jobs:
             exit 1
           fi
 
+      - name: Pack smoke test
+        run: |
+          npm pack
+          TARBALL=$(ls gpt-web-bridge-*.tgz | head -1)
+          mkdir -p /tmp/gpt-web-bridge-smoke
+          npm install -g "./$TARBALL"
+          gpt-web-bridge --version
+          gpt-web-bridge --help
+          gpt-web-bridge conversations --json
+
       - name: Publish to npm
         run: npm publish --access public
         env:

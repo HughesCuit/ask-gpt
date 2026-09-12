@@ -386,6 +386,49 @@ async function openIsolatedPage(context) {
   return page;
 }
 
+/**
+ * Runtime check that we are actually in temporary-chat mode.
+ * URL alone is not enough — product behavior can change.
+ */
+async function assertTemporaryChat(page, { timeoutMs = 8000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const url = page.url() || '';
+    if (/temporary-chat=true/i.test(url)) {
+      // Confirm UI shows temporary indicator when present; if none, URL is still our best signal.
+      const badge = page
+        .locator(
+          '[data-testid*="temporary"], :has-text("Temporary"), :has-text("临时"), [aria-label*="Temporary"], [aria-label*="临时"]'
+        )
+        .first();
+      const hasBadge = await badge.isVisible({ timeout: 200 }).catch(() => false);
+      return { ok: true, url, verified: hasBadge ? 'url+badge' : 'url' };
+    }
+    await page.waitForTimeout(300);
+  }
+  return { ok: false, url: page.url(), verified: false };
+}
+
+/** After opening /c/<id>, confirm we did not land on a different/new chat. */
+async function verifyConversationOwnership(page, expectedId, { timeoutMs = 10000 } = {}) {
+  if (!expectedId) return { ok: true, reason: 'no-expected-id' };
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const actual = extractConversationId(page.url());
+    if (actual && actual.toLowerCase() === expectedId.toLowerCase()) {
+      return { ok: true, id: actual };
+    }
+    // Permanent redirect away from expected chat
+    if (actual && actual.toLowerCase() !== expectedId.toLowerCase()) {
+      return { ok: false, expected: expectedId, actual };
+    }
+    await page.waitForTimeout(400);
+  }
+  const actual = extractConversationId(page.url());
+  if (actual && actual.toLowerCase() === expectedId.toLowerCase()) return { ok: true, id: actual };
+  return { ok: false, expected: expectedId, actual: actual || null, url: page.url() };
+}
+
 /** Saved (normal) chat — history/memory when ChatGPT settings allow. */
 async function openSavedPage(context, { conversationId = null } = {}) {
   const page = await context.newPage();
@@ -425,6 +468,51 @@ function resolveConversationRef(ref) {
   if (all[ref]?.id) return { name: ref, id: all[ref].id };
   if (/^[0-9a-f-]{36}$/i.test(ref)) return { name: null, id: ref };
   return null;
+}
+
+function conversationLockPath(name) {
+  const safe = String(name).replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(RUNTIME_ROOT, `conv-${safe}.lock`);
+}
+
+async function acquireConversationLock(name, waitMs = 30_000) {
+  if (!name) return () => {};
+  const lockPath = conversationLockPath(name);
+  const start = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+      fs.mkdirSync(lockPath);
+      fs.writeFileSync(path.join(lockPath, 'pid'), String(process.pid));
+      return () => {
+        try {
+          fs.rmSync(lockPath, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      };
+    } catch {
+      if (lockIsStale(lockPath)) {
+        try {
+          fs.rmSync(lockPath, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
+      if (Date.now() - start >= waitMs) {
+        die(
+          JSON.stringify({
+            ok: false,
+            code: 'CONV_LOCK_TIMEOUT',
+            error: `Conversation "${name}" is locked by another process`,
+            retryable: true,
+          })
+        );
+      }
+      await sleep(250);
+    }
+  }
 }
 
 async function cmdConversations(format) {
@@ -488,25 +576,25 @@ async function saveDebugBundle(page, meta) {
     const screenshot = path.join(dir, 'screenshot.png');
     const htmlPath = path.join(dir, 'page.html');
     const errPath = path.join(dir, 'error.json');
+    const runtimePath = path.join(dir, 'runtime.json');
     if (page) {
       await page.screenshot({ path: screenshot, fullPage: true }).catch(() => {});
       const html = await page.content().catch(() => '');
       fs.writeFileSync(htmlPath, html, 'utf8');
     }
-    fs.writeFileSync(
-      errPath,
-      JSON.stringify(
-        {
-          ...meta,
-          url: page ? page.url() : null,
-          timestamp: new Date().toISOString(),
-          selectors_version: SEL.version,
-        },
-        null,
-        2
-      ),
-      'utf8'
-    );
+    const runtime = {
+      version: PKG_VERSION,
+      node: process.version,
+      platform: process.platform,
+      url: page ? page.url() : null,
+      title: page ? await page.title().catch(() => null) : null,
+      selectors_version: SEL.version,
+      profile: PROFILE_DIR,
+      timestamp: new Date().toISOString(),
+      ...meta,
+    };
+    fs.writeFileSync(errPath, JSON.stringify(runtime, null, 2), 'utf8');
+    fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2), 'utf8');
     return dir;
   } catch {
     return null;
@@ -726,7 +814,8 @@ async function cmdAsk(argv) {
   const headless = flags.has('headless') ? true : !headed;
   const reuse = flags.has('reuse');
   const useLock = !flags.has('no-lock');
-  const requestId = crypto.randomBytes(4).toString('hex');
+  const requestId = crypto.randomBytes(8).toString('hex');
+  const promptFingerprint = crypto.createHash('sha256').update(question).digest('hex').slice(0, 16);
 
   // Conversation mode:
   //   temporary (default) — isolated, no history
@@ -753,8 +842,12 @@ async function cmdAsk(argv) {
   }
 
   let release = null;
+  let releaseConv = null;
   if (useLock) {
     release = await acquireLock(waitLock ?? DEFAULT_LOCK_WAIT);
+  }
+  if (wantSaved && conversationName) {
+    releaseConv = await acquireConversationLock(conversationName, waitLock ?? DEFAULT_LOCK_WAIT);
   }
 
   const context = await launch({ headed: !headless });
@@ -773,6 +866,60 @@ async function cmdAsk(argv) {
         format
       );
       return 2;
+    }
+
+    // P0: refuse to send if temporary mode cannot be confirmed
+    if (!reuse && !wantSaved) {
+      const temp = await assertTemporaryChat(page);
+      if (!temp.ok) {
+        const debugDir = await saveDebugBundle(page, {
+          code: 'SESSION_MODE_UNKNOWN',
+          stage: 'mode-verify',
+          url: temp.url,
+        });
+        writeOutcome(
+          failResult(
+            'SESSION_MODE_UNKNOWN',
+            'Could not confirm temporary-chat mode; refusing to send (history pollution risk)',
+            {
+              hint: 'Retry with --headed, or explicitly use --saved --name <topic> if a normal chat is intended.',
+              stage: 'mode-verify',
+              debug_dir: debugDir,
+              retryable: true,
+            }
+          ),
+          format
+        );
+        return 1;
+      }
+    }
+
+    // P0: resume ownership — must still be on the expected /c/<id>
+    if (wantSaved && conversationId) {
+      const own = await verifyConversationOwnership(page, conversationId);
+      if (!own.ok) {
+        const debugDir = await saveDebugBundle(page, {
+          code: 'CONVERSATION_MISMATCH',
+          stage: 'resume-verify',
+          expected: own.expected,
+          actual: own.actual,
+          url: own.url,
+        });
+        writeOutcome(
+          failResult(
+            'CONVERSATION_MISMATCH',
+            `Expected conversation ${conversationId} but landed on ${own.actual || 'unknown'}`,
+            {
+              hint: 'The chat may have been deleted. Create a new --saved --name chat.',
+              stage: 'resume-verify',
+              debug_dir: debugDir,
+              retryable: false,
+            }
+          ),
+          format
+        );
+        return 1;
+      }
     }
 
     const composer = await findComposer(page, 25_000);
@@ -862,6 +1009,7 @@ async function cmdAsk(argv) {
     writeOutcome(
       okResult(reply, {
         request_id: requestId,
+        prompt_fingerprint: promptFingerprint,
         duration_ms: durationMs,
         conversation: mode,
         conversation_id: convId,
@@ -879,6 +1027,8 @@ async function cmdAsk(argv) {
     });
     writeOutcome(
       failResult('EXCEPTION', String(err && err.message ? err.message : err), {
+        request_id: requestId,
+        prompt_fingerprint: promptFingerprint,
         debug_dir: debugDir,
         retryable: true,
       }),
@@ -887,6 +1037,7 @@ async function cmdAsk(argv) {
     return 1;
   } finally {
     await context.close().catch(() => {});
+    if (releaseConv) releaseConv();
     if (release) release();
   }
 }
@@ -995,6 +1146,12 @@ Defaults:
 
 Exit codes:
   0 ok | 1 UI_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
+
+Safety (1.0.5+):
+  temporary mode is runtime-verified before send (SESSION_MODE_UNKNOWN)
+  --resume verifies URL conversation id (CONVERSATION_MISMATCH)
+  named --saved/--resume hold a per-topic lock
+  secret scan runs before send
 
 Runtime:
   ~/.ask-gpt/{browser-profile,runtime.lock,conversations.json,selectors.json,debug/}

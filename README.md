@@ -248,6 +248,8 @@ Debug bundles: `~/.ask-gpt/debug/`
 | `TIMEOUT` | Raise `ASK_GPT_TIMEOUT_MS` |
 | `SECRET_DETECTED` | Redact keys and retry |
 | `LOCK_TIMEOUT` | Wait or increase `--wait-lock` |
+| `SESSION_MODE_UNKNOWN` | Temporary mode not confirmed; use `--headed` or `--saved` |
+| `CONVERSATION_MISMATCH` | Resume landed on wrong `/c/<id>`; recreate with `--saved --name` |
 
 ## Development
 
