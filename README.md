@@ -1,6 +1,6 @@
-# web-gpt
+# gpt-web-bridge
 
-CLI names: `web-gpt` (and alias `ask-gpt`)
+CLI names: `gpt-web-bridge`, `web-gpt`, `ask-gpt`
 
 **Unofficial** browser automation bridge for ChatGPT web. Not affiliated with OpenAI.
 
@@ -27,15 +27,13 @@ It drives **your locally logged-in** `chatgpt.com` session (dedicated Playwright
 
 ```bash
 # one-shot / agents
-npx -y @heventure/web-gpt --help
+npx -y gpt-web-bridge --help
 
 # or global
-npm install -g @heventure/web-gpt
+npm install -g gpt-web-bridge
 ```
 
-This installs the `web-gpt` command (alias: `ask-gpt`).
-
-> Unscoped name `web-gpt` is **blocked by npm** (too similar to existing package `webgpt`). Use `@heventure/web-gpt`.
+Commands: `gpt-web-bridge`, `web-gpt`, `ask-gpt`.
 
 Requires:
 

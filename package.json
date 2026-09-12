@@ -1,9 +1,10 @@
 {
-  "name": "web-gpt",
+  "name": "gpt-web-bridge",
   "version": "1.0.0",
   "description": "Unofficial browser bridge to a logged-in ChatGPT web session for coding agents. Temporary chats, JSON output, profile lock, debug bundles.",
   "type": "module",
   "bin": {
+    "gpt-web-bridge": "bin/web-gpt.js",
     "web-gpt": "bin/web-gpt.js",
     "ask-gpt": "bin/web-gpt.js"
   },
@@ -22,9 +23,11 @@
     "test": "node --check src/cli.mjs && node src/cli.mjs --help && node src/cli.mjs --version"
   },
   "keywords": [
+    "gpt-web-bridge",
+    "web-gpt",
+    "ask-gpt",
     "chatgpt",
     "openai",
-    "web-gpt",
     "coding-agent",
     "browser-automation",
     "playwright",
