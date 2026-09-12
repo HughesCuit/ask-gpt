@@ -1,4 +1,6 @@
-# ask-gpt
+# @richardhughes/ask-gpt
+
+CLI name: `ask-gpt`
 
 **Unofficial** browser automation bridge for ChatGPT web. Not affiliated with OpenAI.
 
@@ -24,8 +26,10 @@ It drives **your locally logged-in** `chatgpt.com` session (dedicated Playwright
 ## Install
 
 ```bash
-npm install -g ask-gpt
+npm install -g @richardhughes/ask-gpt
 ```
+
+This installs the `ask-gpt` command.
 
 Requires:
 
