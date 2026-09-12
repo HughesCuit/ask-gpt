@@ -16,6 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { chipLooksSelected, thinkingMeta } from './thinking-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -638,14 +639,6 @@ async function readThinkingChipState(page) {
     }
     return null;
   });
-}
-
-function chipLooksSelected(state) {
-  if (!state) return false;
-  if (state.pressed === 'true' || state.pressed === 'on' || state.pressed === 'checked') return true;
-  if (state.selectedAttr === 'true' || state.selectedAttr === 'ancestor') return true;
-  if (state.hasActiveClass) return true;
-  return false;
 }
 
 /**
@@ -1429,10 +1422,7 @@ async function cmdAsk(argv) {
         reply_hash: reply.hash,
         truncated: !!reply.truncated,
         thinking_requested: wantThinking,
-        thinking_enabled: !!thinking.ok && !!thinking.verified,
-        thinking_clicked: !!thinking.ok,
-        thinking_method: thinking.method,
-        thinking_detail: thinking.detail || thinking.buttons || null,
+        ...thinkingMeta({ ...thinking, requested: wantThinking }),
         duration_ms: durationMs,
         conversation: mode,
         conversation_id: convId,

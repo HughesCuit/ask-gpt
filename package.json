@@ -20,7 +20,7 @@
   },
   "scripts": {
     "start": "node src/cli.mjs",
-    "test": "node --check src/cli.mjs && node src/cli.mjs --help && node src/cli.mjs --version && node --test test/unit.test.mjs test/lock-race.test.mjs"
+    "test": "node --check src/cli.mjs && node src/cli.mjs --help && node src/cli.mjs --version && node --test test/unit.test.mjs test/lock-race.test.mjs test/thinking-state.test.mjs"
   },
   "keywords": [
     "gpt-web-bridge",
