@@ -256,9 +256,20 @@ function scanSecrets(text) {
     /-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/,
     /xox[baprs]-[A-Za-z0-9-]{10,}/,
     /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
-    /(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['"]?[^\s'"]{12,}/i,
   ];
-  return patterns.some((re) => re.test(text));
+  if (patterns.some((re) => re.test(text))) return true;
+  // key=value secrets — require a value that looks like a credential, not source code.
+  const kv =
+    /(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['"]?([^\s'"]{16,})/i;
+  const m = text.match(kv);
+  if (m) {
+    const val = m[1] || '';
+    // Ignore obvious code / API surface (crypto.randomBytes, process.env, etc.)
+    if (!/^(crypto|process|require|import|fs|path|Buffer|JSON|toString|randomBytes)/i.test(val)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /* -------------------- browser -------------------- */
