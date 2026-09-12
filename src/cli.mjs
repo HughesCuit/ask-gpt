@@ -1042,6 +1042,7 @@ async function cmdAsk(argv) {
   let release = null;
   let releaseConv = null;
   let context = null;
+  let page = null;
   try {
     if (useLock) {
       release = await acquireLock(waitLock ?? DEFAULT_LOCK_WAIT);
@@ -1051,7 +1052,6 @@ async function cmdAsk(argv) {
     }
 
     context = await launch({ headed: !headless });
-    let page = null;
     if (reuse) page = await openReusablePage(context);
     else if (wantSaved) page = await openSavedPage(context, { conversationId });
     else page = await openIsolatedPage(context);
