@@ -1,0 +1,46 @@
+{
+  "name": "ask-gpt",
+  "version": "1.0.0",
+  "description": "Unofficial browser bridge to a logged-in ChatGPT web session for coding agents. Temporary chats, JSON output, profile lock, debug bundles.",
+  "type": "module",
+  "bin": {
+    "ask-gpt": "bin/ask-gpt.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "selectors.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "test": "node --check src/cli.mjs && node src/cli.mjs --help && node src/cli.mjs --version"
+  },
+  "keywords": [
+    "chatgpt",
+    "openai",
+    "coding-agent",
+    "browser-automation",
+    "playwright",
+    "ai-agent",
+    "cli",
+    "second-opinion"
+  ],
+  "author": "HughesCuit",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HughesCuit/ask-gpt.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HughesCuit/ask-gpt/issues"
+  },
+  "homepage": "https://github.com/HughesCuit/ask-gpt#readme",
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

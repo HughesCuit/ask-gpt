@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "composer": [
+    "div[id=\"prompt-textarea\"][contenteditable=\"true\"]:not(.fallbackTextarea)",
+    "div.ProseMirror[contenteditable=\"true\"]",
+    "div[contenteditable=\"true\"][data-lexical-editor=\"true\"]",
+    "div[contenteditable=\"true\"][aria-label*=\"ChatGPT\"]",
+    "div[contenteditable=\"true\"][aria-label*=\"chat\"]",
+    "div[contenteditable=\"true\"][aria-label*=\"聊天\"]",
+    "#prompt-textarea[contenteditable=\"true\"]",
+    "textarea[name=\"prompt-textarea\"]:not(.fallbackTextarea)",
+    "textarea#prompt-textarea"
+  ],
+  "send": [
+    "button[data-testid=\"send-button\"]",
+    "button[aria-label=\"Send prompt\"]",
+    "button[aria-label=\"发送\"]",
+    "button[aria-label*=\"Send\"]",
+    "button[aria-label*=\"发送\"]",
+    "[data-testid=\"send-button\"]"
+  ],
+  "assistant": [
+    "[data-message-author-role=\"assistant\"]",
+    "article[data-testid^=\"conversation-turn\"] [data-message-author-role=\"assistant\"]",
+    "div[data-message-author-role=\"assistant\"]"
+  ],
+  "stop": [
+    "button[data-testid=\"stop-button\"]",
+    "button[aria-label=\"Stop streaming\"]",
+    "button[aria-label=\"停止\"]"
+  ],
+  "loginHints": [
+    "button:has-text(\"Log in\")",
+    "button:has-text(\"登录\")",
+    "a:has-text(\"Log in\")",
+    "a:has-text(\"登录\")",
+    "[data-testid=\"login-button\"]"
+  ],
+  "dismiss": [
+    "button:has-text(\"Accept all\")",
+    "button:has-text(\"全部接受\")",
+    "button:has-text(\"同意\")",
+    "button:has-text(\"Got it\")",
+    "button:has-text(\"知道了\")",
+    "button:has-text(\"Close\")",
+    "button:has-text(\"关闭\")",
+    "button:has-text(\"Skip\")",
+    "button:has-text(\"跳过\")",
+    "button:has-text(\"Continue\")",
+    "button:has-text(\"Not now\")",
+    "button[aria-label=\"Close\"]",
+    "button[aria-label=\"关闭\"]"
+  ]
+}
