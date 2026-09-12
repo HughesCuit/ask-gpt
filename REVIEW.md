@@ -10,8 +10,9 @@ Do **not** rely on pasted snippets as the primary source. Point the reviewer at 
 | --- | --- |
 | Repo | https://github.com/heventure/gpt-web-bridge |
 | Default branch | `main` |
-| CLI entry | https://github.com/heventure/gpt-web-bridge/blob/main/src/cli.mjs |
-| Raw CLI | https://raw.githubusercontent.com/heventure/gpt-web-bridge/main/src/cli.mjs |
+| **Integration branch (work in progress)** | `dev` |
+| Dev raw CLI | https://raw.githubusercontent.com/heventure/gpt-web-bridge/dev/src/cli.mjs |
+| Main raw CLI | https://raw.githubusercontent.com/heventure/gpt-web-bridge/main/src/cli.mjs |
 | package.json (raw) | https://raw.githubusercontent.com/heventure/gpt-web-bridge/main/package.json |
 | Release workflow (raw) | https://raw.githubusercontent.com/heventure/gpt-web-bridge/main/.github/workflows/release.yml |
 | selectors.json (raw) | https://raw.githubusercontent.com/heventure/gpt-web-bridge/main/selectors.json |
@@ -25,6 +26,8 @@ Always state the **version under review** (e.g. `1.1.5`) and, when possible, the
 https://github.com/heventure/gpt-web-bridge/releases/tag/v1.1.5
 https://github.com/heventure/gpt-web-bridge/tree/v1.1.5
 ```
+
+During **pre-release review**, use `dev` raw URLs (and the PR/commit SHA), not `main`, until merge.
 
 ## How to run a review in the continuous ChatGPT session
 
@@ -62,3 +65,37 @@ Tag: https://github.com/heventure/gpt-web-bridge/releases/tag/vX.Y.Z
 2. If the web session cannot fetch URLs, **you** (local agent) download the raw files and attach them in the same ask — still include the GitHub URLs and version tag so the review is anchored to the repo.
 3. Never review from memory of an older paste without restating version + tag.
 4. Keep using `--resume gpt-web-bridge-review` so prior rounds stay in one thread.
+
+## Release process (mandatory)
+
+Do **not** publish from a dirty working tree or straight from feature work on `main`.
+
+```text
+1. Implement changes
+2. Commit on branch:  dev
+3. git push origin dev
+4. GPT review loop (this file) against dev raw URLs + commit SHA
+   - Fix P0/P1 on dev, push, re-review
+   - Repeat until GPT explicitly allows release / "可封版"
+5. Only then:
+   - merge dev → main
+   - npm version <patch|minor|major>
+   - git push --follow-tags
+   - GitHub Release tag  → Action publishes to npm
+```
+
+Hard rules:
+
+- **No `npm version` / GitHub Release / npm publish until GPT approves** the current `dev` commit.
+- Review prompts must say: source of truth is **`dev`**, include commit SHA.
+- Approval must be explicit (e.g. 可以封版 / LGTM to release / GO). A high score alone is not enough if GPT lists unaddressed P0/P1.
+- After merge+release, one short confirmation review against the **tag** is optional.
+
+### Pre-release review prompt sketch
+
+```text
+【pre-release 验收 / dev @ <sha>】
+以 GitHub dev 分支为准（不要用 main）。
+必读: https://raw.githubusercontent.com/heventure/gpt-web-bridge/dev/src/cli.mjs
+输出: P0/P1、是否允许 merge→main 并发版（必须明确 GO / NO-GO）。
+```
