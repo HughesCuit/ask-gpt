@@ -606,19 +606,67 @@ async function openSavedPage(context, { conversationId = null } = {}) {
   return page;
 }
 
+/** Read whether a Think/思考 chip looks selected. */
+async function readThinkingChipState(page) {
+  return page.evaluate(() => {
+    const nodes = document.querySelectorAll('button, [role="button"]');
+    for (const el of nodes) {
+      const t = (el.innerText || el.textContent || '').replace(/\s+/g, '').trim();
+      const aria = el.getAttribute('aria-label') || '';
+      if (!/(思考|thinking|think|reason)/i.test(t) && !/(思考|thinking|think|reason)/i.test(aria)) {
+        continue;
+      }
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      const pressed =
+        el.getAttribute('aria-pressed') ||
+        el.getAttribute('data-state') ||
+        el.getAttribute('aria-checked') ||
+        el.getAttribute('data-selected') ||
+        null;
+      const cls = el.className && typeof el.className === 'string' ? el.className : '';
+      return {
+        text: t.slice(0, 30),
+        aria,
+        pressed,
+        selectedAttr:
+          el.getAttribute('aria-selected') ||
+          (el.closest('[aria-selected="true"]') ? 'ancestor' : null),
+        hasActiveClass: /(^|\s)(active|selected|on)(\s|$)/i.test(cls) || /selected|active/i.test(cls),
+        html: el.outerHTML.slice(0, 180),
+      };
+    }
+    return null;
+  });
+}
+
+function chipLooksSelected(state) {
+  if (!state) return false;
+  if (state.pressed === 'true' || state.pressed === 'on' || state.pressed === 'checked') return true;
+  if (state.selectedAttr === 'true' || state.selectedAttr === 'ancestor') return true;
+  if (state.hasActiveClass) return true;
+  return false;
+}
+
 /**
  * Best-effort enable ChatGPT "Thinking" / reasoning mode.
- * Current UI often exposes a composer chip/button labeled 思考 / Thinking.
+ * Current UI often exposes a composer chip/button labeled Think / 思考 / Thinking.
  */
 async function enableThinkingMode(page) {
   try {
-    // 1) DOM scan for composer chip labeled 思考 / Thinking (more reliable than :has-text for CJK)
+    const before = await readThinkingChipState(page);
+    if (chipLooksSelected(before)) {
+      return { ok: true, verified: true, method: 'already-on', detail: before };
+    }
+
     const clicked = await page.evaluate(() => {
       const nodes = document.querySelectorAll('button, [role="button"]');
       for (const el of nodes) {
         const t = (el.innerText || el.textContent || '').replace(/\s+/g, '').trim();
         const aria = el.getAttribute('aria-label') || '';
-        if (!/(思考|thinking|think|reason)/i.test(t) && !/(思考|thinking|think|reason)/i.test(aria)) continue;
+        if (!/(思考|thinking|think|reason)/i.test(t) && !/(思考|thinking|think|reason)/i.test(aria)) {
+          continue;
+        }
         const r = el.getBoundingClientRect();
         if (r.width < 8 || r.height < 8) continue;
         el.click();
@@ -627,11 +675,18 @@ async function enableThinkingMode(page) {
       return null;
     });
     if (clicked) {
-      await page.waitForTimeout(400);
-      return { ok: true, method: 'dom-click', detail: clicked };
+      await page.waitForTimeout(500);
+      const after = await readThinkingChipState(page);
+      const verified = chipLooksSelected(after);
+      return {
+        ok: true,
+        verified,
+        method: verified ? 'dom-click-verified' : 'dom-click-unverified',
+        detail: after || clicked,
+      };
     }
 
-    // 2) Open model switcher then pick option
+    // model switcher fallback
     let trigger = null;
     for (const sel of selList('thinkingTrigger')) {
       const loc = page.locator(sel).first();
@@ -651,9 +706,16 @@ async function enableThinkingMode(page) {
       const t = visibleText(await items.nth(i).innerText().catch(() => ''));
       if (/think|思考|reason/i.test(t)) {
         await items.nth(i).click({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(400);
         await page.keyboard.press('Escape').catch(() => {});
-        return { ok: true, method: 'menuitem-text', text: t.slice(0, 30) };
+        const after = await readThinkingChipState(page);
+        const verified = chipLooksSelected(after);
+        return {
+          ok: true,
+          verified,
+          method: verified ? 'picker-verified' : 'picker-unverified',
+          detail: after || { text: t.slice(0, 30) },
+        };
       }
     }
     await page.keyboard.press('Escape').catch(() => {});
@@ -665,9 +727,13 @@ async function enableThinkingMode(page) {
           .slice(0, 40)
       )
       .catch(() => []);
-    return { ok: false, method: 'option-not-found', buttons: btnTexts };
+    return { ok: false, verified: false, method: 'option-not-found', buttons: btnTexts };
   } catch (err) {
-    return { ok: false, method: 'error:' + String(err.message || err).slice(0, 80) };
+    return {
+      ok: false,
+      verified: false,
+      method: 'error:' + String(err.message || err).slice(0, 80),
+    };
   }
 }
 
@@ -1363,7 +1429,8 @@ async function cmdAsk(argv) {
         reply_hash: reply.hash,
         truncated: !!reply.truncated,
         thinking_requested: wantThinking,
-        thinking_enabled: !!thinking.ok,
+        thinking_enabled: !!thinking.ok && !!thinking.verified,
+        thinking_clicked: !!thinking.ok,
         thinking_method: thinking.method,
         thinking_detail: thinking.detail || thinking.buttons || null,
         duration_ms: durationMs,
