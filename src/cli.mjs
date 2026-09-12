@@ -227,23 +227,35 @@ function failLockTimeout(code, message) {
   process.exit(6);
 }
 
+/**
+ * Atomically create a lock directory that already contains owner.json.
+ * Staging dir is fully written, then renamed onto lockPath (fails if exists).
+ * Avoids the mkdir → write-meta window where another process sees an ownerless lock.
+ */
+function tryCreateLockDir(lockPath) {
+  const staging =
+    lockPath + '.staging.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
+  fs.mkdirSync(staging);
+  try {
+    const meta = writeLockMeta(staging);
+    fs.renameSync(staging, lockPath);
+    return meta;
+  } catch (err) {
+    try {
+      fs.rmSync(staging, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+}
+
 async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
   fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
   const start = Date.now();
   for (;;) {
     try {
-      fs.mkdirSync(LOCK_DIR);
-      let meta;
-      try {
-        meta = writeLockMeta(LOCK_DIR);
-      } catch (err) {
-        try {
-          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-        throw err;
-      }
+      const meta = tryCreateLockDir(LOCK_DIR);
       return () => releaseLockOwned(LOCK_DIR, meta.owner_token);
     } catch {
       if (lockIsStale(LOCK_DIR)) {
@@ -638,8 +650,7 @@ async function acquireConversationLock(name, waitMs = 30_000) {
   for (;;) {
     try {
       fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
-      fs.mkdirSync(lockPath);
-      const meta = writeLockMeta(lockPath);
+      const meta = tryCreateLockDir(lockPath);
       return () => releaseLockOwned(lockPath, meta.owner_token);
     } catch {
       if (lockIsStale(lockPath)) {

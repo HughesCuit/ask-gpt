@@ -77,6 +77,21 @@ test('scanSecrets flags sk- and ignores crypto.randomBytes token code', () => {
   assert.equal(code.ok, true);
 });
 
+test('staging lock create is atomic (rename fails if lock exists)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gptweb-atomic-'));
+  const lock = path.join(dir, 'L');
+  const staging = path.join(dir, 'S');
+  fs.mkdirSync(staging);
+  writeLockMeta(staging);
+  fs.renameSync(staging, lock);
+  const staging2 = path.join(dir, 'S2');
+  fs.mkdirSync(staging2);
+  writeLockMeta(staging2);
+  assert.throws(() => fs.renameSync(staging2, lock));
+  fs.rmSync(staging2, { recursive: true, force: true });
+  assert.ok(fs.existsSync(path.join(lock, 'owner.json')));
+});
+
 test('temporary url contract helpers', () => {
   const extract = (url) => {
     const m = /\/c\/([0-9a-f-]{36})/i.exec(url || '');
