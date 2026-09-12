@@ -43,6 +43,7 @@ const LEGACY_PROFILE = path.join(
 );
 const LOCK_DIR = path.join(RUNTIME_ROOT, 'runtime.lock');
 const DEBUG_ROOT = path.join(RUNTIME_ROOT, 'debug');
+const CONV_STORE = path.join(RUNTIME_ROOT, 'conversations.json');
 const SELECTORS_PATH =
   process.env.ASK_GPT_SELECTORS || path.join(PKG_ROOT, 'selectors.json');
 const USER_SELECTORS = path.join(RUNTIME_ROOT, 'selectors.json');
@@ -385,6 +386,68 @@ async function openIsolatedPage(context) {
   return page;
 }
 
+/** Saved (normal) chat — history/memory when ChatGPT settings allow. */
+async function openSavedPage(context, { conversationId = null } = {}) {
+  const page = await context.newPage();
+  const url = conversationId ? `https://chatgpt.com/c/${conversationId}` : BASE_URL;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await page.waitForTimeout(3000);
+  await dismissOverlays(page);
+  await page.waitForTimeout(500);
+  await dismissOverlays(page);
+  return page;
+}
+
+function extractConversationId(url) {
+  const m = /\/c\/([0-9a-f-]{36})/i.exec(url || '');
+  return m ? m[1] : null;
+}
+
+function loadConversations() {
+  try {
+    if (!fs.existsSync(CONV_STORE)) return {};
+    const raw = fs.readFileSync(CONV_STORE, 'utf8').replace(/^﻿/, '');
+    return JSON.parse(raw) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveConversation(name, record) {
+  const all = loadConversations();
+  all[name] = { ...record, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+  fs.writeFileSync(CONV_STORE, JSON.stringify(all, null, 2), 'utf8');
+}
+
+function resolveConversationRef(ref) {
+  const all = loadConversations();
+  if (all[ref]?.id) return { name: ref, id: all[ref].id };
+  if (/^[0-9a-f-]{36}$/i.test(ref)) return { name: null, id: ref };
+  return null;
+}
+
+async function cmdConversations(format) {
+  const all = loadConversations();
+  const items = Object.entries(all)
+    .map(([name, v]) => ({
+      name,
+      id: v.id || null,
+      title: v.title || null,
+      updatedAt: v.updatedAt || null,
+      url: v.id ? `https://chatgpt.com/c/${v.id}` : null,
+    }))
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  if (format === 'json') emit({ ok: true, conversations: items });
+  else {
+    if (!items.length) process.stdout.write('(no saved conversations)\n');
+    for (const it of items) {
+      process.stdout.write(`${it.name}\t${it.id || '-'}\t${it.updatedAt || '-'}\n`);
+    }
+  }
+  return 0;
+}
+
 async function openReusablePage(context) {
   const pages = context.pages();
   let page = pages.find((p) => (p.url() || '').includes('chatgpt.com'));
@@ -489,20 +552,31 @@ function parseAskArgs(argv) {
   let filePath = null;
   let format = null;
   let waitLock = null;
+  let name = null;
+  let resume = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--file' || a === '-f') filePath = argv[++i];
     else if (a === '--stdin') flags.add('stdin');
     else if (a === '--json') format = 'json';
     else if (a === '--text') format = 'text';
-    else if (a === '--new' || a === '--isolate') flags.add('isolate');
-    else if (a === '--reuse' || a === '--reuse-session') flags.add('reuse');
+    else if (a === '--new' || a === '--isolate' || a === '--temporary' || a === '--temp') {
+      flags.add('temporary');
+    } else if (a === '--saved' || a === '--memory' || a === '--persistent') {
+      flags.add('saved');
+    } else if (a === '--name' || a === '--topic') {
+      name = argv[++i];
+      flags.add('saved');
+    } else if (a === '--resume') {
+      resume = argv[++i];
+      flags.add('saved');
+    } else if (a === '--reuse' || a === '--reuse-session') flags.add('reuse');
     else if (a === '--headed' || a === '--headless') flags.add(a.slice(2));
     else if (a === '--wait-lock') waitLock = Number(argv[++i]);
     else if (a === '--no-lock') flags.add('no-lock');
     else textParts.push(a);
   }
-  return { flags, filePath, format, textParts, waitLock };
+  return { flags, filePath, format, textParts, waitLock, name, resume };
 }
 
 async function resolveQuestion(argv) {
@@ -634,7 +708,7 @@ async function cmdHealth(format) {
 
 async function cmdAsk(argv) {
   const started = Date.now();
-  const { question, flags, format: fmtArg, waitLock } = await resolveQuestion(argv);
+  const { question, flags, format: fmtArg, waitLock, name, resume } = await resolveQuestion(argv);
   const format = fmtArg || (process.env.ASK_GPT_FORMAT === 'json' ? 'json' : 'text');
 
   if (scanSecrets(question)) {
@@ -654,6 +728,30 @@ async function cmdAsk(argv) {
   const useLock = !flags.has('no-lock');
   const requestId = crypto.randomBytes(4).toString('hex');
 
+  // Conversation mode:
+  //   temporary (default) — isolated, no history
+  //   saved --name topic  — normal chat, remember id under name
+  //   saved --resume name|id — continue an existing chat
+  const wantSaved = flags.has('saved') || !!name || !!resume;
+  let conversationId = null;
+  let conversationName = name || null;
+  if (resume) {
+    const resolved = resolveConversationRef(resume);
+    if (!resolved) {
+      writeOutcome(
+        failResult('CONV_NOT_FOUND', `No saved conversation for "${resume}"`, {
+          hint: 'Use --name topic on a --saved ask first, or pass a /c/<uuid> id.',
+        }),
+        format
+      );
+      return 1;
+    }
+    conversationId = resolved.id;
+    conversationName = conversationName || resolved.name;
+  } else if (name) {
+    conversationId = loadConversations()[name]?.id || null;
+  }
+
   let release = null;
   if (useLock) {
     release = await acquireLock(waitLock ?? DEFAULT_LOCK_WAIT);
@@ -662,12 +760,14 @@ async function cmdAsk(argv) {
   const context = await launch({ headed: !headless });
   let page = null;
   try {
-    page = reuse ? await openReusablePage(context) : await openIsolatedPage(context);
+    if (reuse) page = await openReusablePage(context);
+    else if (wantSaved) page = await openSavedPage(context, { conversationId });
+    else page = await openIsolatedPage(context);
 
     if (await isLoggedOut(page)) {
       writeOutcome(
         failResult('NEED_LOGIN', 'Not logged in', {
-          hint: 'Run: ask-gpt login',
+          hint: 'Run: gpt-web-bridge login',
           stage: 'auth',
         }),
         format
@@ -747,11 +847,25 @@ async function cmdAsk(argv) {
       return 4;
     }
 
+    const convId = extractConversationId(page.url()) || conversationId;
+    const mode = reuse ? 'reused' : wantSaved ? 'saved' : 'temporary';
+    if (wantSaved && conversationName && convId) {
+      const title = visibleText(
+        await page
+          .locator('title')
+          .innerText()
+          .catch(() => '')
+      );
+      saveConversation(conversationName, { id: convId, title: title || null, mode: 'saved' });
+    }
+
     writeOutcome(
       okResult(reply, {
         request_id: requestId,
         duration_ms: durationMs,
-        conversation: reuse ? 'reused' : 'temporary',
+        conversation: mode,
+        conversation_id: convId,
+        conversation_name: conversationName,
         lock: useLock ? 'held' : 'disabled',
       }),
       format
@@ -858,28 +972,32 @@ async function main() {
   }
   const [cmd, ...rest] = argv;
   if (!cmd || cmd === '-h' || cmd === '--help') {
-    process.stdout.write(`ask-gpt — consult a logged-in ChatGPT session
+    process.stdout.write(`gpt-web-bridge — consult a logged-in ChatGPT session
 
 Usage:
-  ask-gpt --version
-  ask-gpt login
-  ask-gpt status [--json]
-  ask-gpt health [--json]
-  ask-gpt doctor [--json]
-  ask-gpt ask "question" [--json] [--reuse] [--headed] [--wait-lock ms] [--no-lock]
-  ask-gpt ask --file path [--json] [--stdin]
+  gpt-web-bridge --version
+  gpt-web-bridge login
+  gpt-web-bridge status|health|doctor [--json]
+  gpt-web-bridge conversations [--json]
+  gpt-web-bridge ask "question" [--json] [--temporary|--saved] [--name topic] [--resume name|id]
+                         [--reuse] [--headed] [--wait-lock ms] [--no-lock]
+  gpt-web-bridge ask --file path [--json] [--stdin]
+
+Conversation modes:
+  --temporary (default)  isolated temporary chat; no history / memory
+  --saved / --name topic normal ChatGPT chat; can use memory; save id under topic
+  --resume name|id       continue a previously named (or /c/<uuid>) conversation
+  --reuse                reuse an existing chatgpt.com tab (rare)
 
 Defaults:
-  isolated temporary chat; profile file lock enabled
-  dedicated profile at ~/.ask-gpt/browser-profile (never your daily Chrome profile)
+  temporary chat; profile file lock enabled
+  dedicated profile at ~/.ask-gpt/browser-profile
 
 Exit codes:
   0 ok | 1 UI_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
 
 Runtime:
-  home/profile: ~/.ask-gpt
-  user selectors override: ~/.ask-gpt/selectors.json
-  debug bundles: ~/.ask-gpt/debug/
+  ~/.ask-gpt/{browser-profile,runtime.lock,conversations.json,selectors.json,debug/}
 `);
     return 0;
   }
@@ -888,6 +1006,7 @@ Runtime:
   if (cmd === 'status') return cmdStatus(json ? 'json' : 'text');
   if (cmd === 'health') return cmdHealth(json ? 'json' : 'text');
   if (cmd === 'doctor') return cmdDoctor(json ? 'json' : 'text');
+  if (cmd === 'conversations' || cmd === 'convs') return cmdConversations(json ? 'json' : 'text');
   if (cmd === 'ask') return cmdAsk(rest);
   die(`Unknown command: ${cmd}`);
 }

@@ -77,6 +77,28 @@ npx -y gpt-web-bridge ask --json --file ./question.txt
 cat brief.md | npx -y gpt-web-bridge ask --json --stdin
 ```
 
+### Conversation modes
+
+| Mode | Flag | Behavior |
+| --- | --- | --- |
+| Temporary (default) | `--temporary` | Isolated chat, no history/memory — safe one-shot |
+| Saved | `--saved --name <topic>` | Normal ChatGPT chat; can use account memory; id stored under `topic` |
+| Resume | `--resume <name\|id>` | Continue a previously saved conversation |
+| Reuse tab | `--reuse` | Continue whatever chatgpt.com tab is already open |
+
+```bash
+# one-shot (default)
+npx -y gpt-web-bridge ask --json "What is a closure?"
+
+# keep context across turns
+npx -y gpt-web-bridge ask --json --saved --name "auth-redesign" "Propose a token refresh flow"
+npx -y gpt-web-bridge ask --json --resume "auth-redesign" "Now sketch the middleware"
+
+npx -y gpt-web-bridge conversations --json
+```
+
+Registry: `~/.ask-gpt/conversations.json` (`topic` → ChatGPT `/c/<uuid>`).
+
 ## Agent skill usage
 
 ### When to use
