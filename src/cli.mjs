@@ -83,7 +83,26 @@ function loadSelectors() {
   try {
     if (fs.existsSync(USER_SELECTORS)) {
       const user = JSON.parse(fs.readFileSync(USER_SELECTORS, 'utf8'));
-      return { ...defaults, ...user, version: user.version ?? defaults.version };
+      const merged = { ...defaults };
+      for (const [k, v] of Object.entries(user)) {
+        if (k === 'version') {
+          merged.version = v;
+          continue;
+        }
+        if (Array.isArray(v) && Array.isArray(defaults[k])) {
+          // User entries first (higher priority), keep defaults as fallbacks.
+          const seen = new Set();
+          merged[k] = [...v, ...defaults[k]].filter((s) => {
+            if (typeof s !== 'string' || !s) return false;
+            if (seen.has(s)) return false;
+            seen.add(s);
+            return true;
+          });
+        } else {
+          merged[k] = v;
+        }
+      }
+      return merged;
     }
   } catch (err) {
     process.stderr.write(`warn: bad user selectors.json: ${err.message}\n`);
@@ -129,30 +148,76 @@ function detectChannel() {
 
 /* -------------------- lock -------------------- */
 
-function lockIsStale(lockPath) {
+function readLockMeta(lockPath) {
   try {
-    const pidFile = path.join(lockPath, 'pid');
-    const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
-    if (!pid) return true;
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      return true;
-    }
+    const raw = fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8');
+    return JSON.parse(raw);
   } catch {
-    return true;
+    return null;
   }
 }
 
+function writeLockMeta(lockPath) {
+  const meta = {
+    pid: process.pid,
+    started_at: Date.now(),
+    owner_token: crypto.randomBytes(16).toString('hex'),
+    version: PKG_VERSION,
+  };
+  fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify(meta, null, 2));
+  fs.writeFileSync(path.join(lockPath, 'pid'), String(meta.pid));
+  return meta;
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Stale if pid dead OR owner.json missing/corrupt OR lock older than 2h with dead-ish owner. */
+function lockIsStale(lockPath) {
+  const meta = readLockMeta(lockPath);
+  if (!meta || !meta.pid) {
+    // Legacy pid-only lock or corrupt: treat as stale if pid file missing or process dead.
+    try {
+      const pid = Number(fs.readFileSync(path.join(lockPath, 'pid'), 'utf8').trim());
+      if (!pid) return true;
+      return !processAlive(pid);
+    } catch {
+      return true;
+    }
+  }
+  if (!processAlive(meta.pid)) return true;
+  // PID reuse guard: if lock claims to be old but process is "alive", also require recent started_at.
+  const age = Date.now() - Number(meta.started_at || 0);
+  if (age > 2 * 60 * 60 * 1000) return true;
+  return false;
+}
+
+function failLockTimeout(code, message) {
+  process.stderr.write(message + '\n');
+  process.stdout.write(
+    JSON.stringify({
+      ok: false,
+      code,
+      error: message,
+      retryable: true,
+    }) + '\n'
+  );
+  process.exit(6);
+}
+
 async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
-  fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+  fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
   const start = Date.now();
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR);
-      fs.writeFileSync(path.join(LOCK_DIR, 'pid'), String(process.pid));
-      fs.writeFileSync(path.join(LOCK_DIR, 'started_at'), new Date().toISOString());
+      writeLockMeta(LOCK_DIR);
       return () => {
         try {
           fs.rmSync(LOCK_DIR, { recursive: true, force: true });
@@ -170,14 +235,9 @@ async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
         continue;
       }
       if (Date.now() - start >= waitMs) {
-        die(
-          JSON.stringify({
-            ok: false,
-            code: 'LOCK_TIMEOUT',
-            error: 'Another ask-gpt instance holds the browser profile lock',
-            retryable: true,
-            hint: 'Increase --wait-lock or kill the other process',
-          })
+        failLockTimeout(
+          'LOCK_TIMEOUT',
+          'Another instance holds the browser profile lock (~/.ask-gpt/runtime.lock)'
         );
       }
       await sleep(250);
@@ -387,26 +447,44 @@ async function openIsolatedPage(context) {
 }
 
 /**
- * Runtime check that we are actually in temporary-chat mode.
- * URL alone is not enough — product behavior can change.
+ * Stronger temporary-session check:
+ *  - URL has temporary-chat=true
+ *  - URL must NOT be a /c/<uuid> saved conversation
+ *  - UI temporary indicator when present
  */
 async function assertTemporaryChat(page, { timeoutMs = 8000 } = {}) {
   const deadline = Date.now() + timeoutMs;
+  let lastUrl = page.url() || '';
   while (Date.now() < deadline) {
     const url = page.url() || '';
-    if (/temporary-chat=true/i.test(url)) {
-      // Confirm UI shows temporary indicator when present; if none, URL is still our best signal.
+    lastUrl = url;
+    const hasTempParam = /temporary-chat=true/i.test(url);
+    const hasConvId = !!extractConversationId(url);
+    if (hasTempParam && !hasConvId) {
       const badge = page
         .locator(
           '[data-testid*="temporary"], :has-text("Temporary"), :has-text("临时"), [aria-label*="Temporary"], [aria-label*="临时"]'
         )
         .first();
-      const hasBadge = await badge.isVisible({ timeout: 200 }).catch(() => false);
-      return { ok: true, url, verified: hasBadge ? 'url+badge' : 'url' };
+      const hasBadge = await badge.isVisible({ timeout: 250 }).catch(() => false);
+      // URL + no conversation id is the hard requirement; badge is a bonus signal.
+      return {
+        ok: true,
+        url,
+        has_conversation_id: hasConvId,
+        has_badge: hasBadge,
+        verified: hasBadge ? 'url+no-cid+badge' : 'url+no-cid',
+      };
     }
     await page.waitForTimeout(300);
   }
-  return { ok: false, url: page.url(), verified: false };
+  return {
+    ok: false,
+    url: lastUrl,
+    has_conversation_id: !!extractConversationId(lastUrl),
+    has_temp_param: /temporary-chat=true/i.test(lastUrl),
+    verified: false,
+  };
 }
 
 /** After opening /c/<id>, confirm we did not land on a different/new chat. */
@@ -459,8 +537,11 @@ function loadConversations() {
 function saveConversation(name, record) {
   const all = loadConversations();
   all[name] = { ...record, updatedAt: new Date().toISOString() };
-  fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
-  fs.writeFileSync(CONV_STORE, JSON.stringify(all, null, 2), 'utf8');
+  fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
+  const tmp = CONV_STORE + '.tmp';
+  const payload = JSON.stringify(all, null, 2);
+  fs.writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, CONV_STORE);
 }
 
 function resolveConversationRef(ref) {
@@ -481,9 +562,9 @@ async function acquireConversationLock(name, waitMs = 30_000) {
   const start = Date.now();
   for (;;) {
     try {
-      fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+      fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
       fs.mkdirSync(lockPath);
-      fs.writeFileSync(path.join(lockPath, 'pid'), String(process.pid));
+      writeLockMeta(lockPath);
       return () => {
         try {
           fs.rmSync(lockPath, { recursive: true, force: true });
@@ -501,13 +582,9 @@ async function acquireConversationLock(name, waitMs = 30_000) {
         continue;
       }
       if (Date.now() - start >= waitMs) {
-        die(
-          JSON.stringify({
-            ok: false,
-            code: 'CONV_LOCK_TIMEOUT',
-            error: `Conversation "${name}" is locked by another process`,
-            retryable: true,
-          })
+        failLockTimeout(
+          'CONV_LOCK_TIMEOUT',
+          `Conversation "${name}" is locked by another process`
         );
       }
       await sleep(250);
@@ -568,19 +645,34 @@ async function isLoggedOut(page) {
 
 /* -------------------- debug artifacts -------------------- */
 
+function scrubHtml(html) {
+  if (!html) return html;
+  let out = html;
+  // emails
+  out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[redacted-email]');
+  // JWT-like
+  out = out.replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted-jwt]');
+  // common token prefixes
+  out = out.replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{10,}/g, '[redacted-token]');
+  // cookie / auth headers style
+  out = out.replace(/(authorization|cookie|set-cookie)\s*[:=]\s*[^\n<]{8,}/gi, '$1: [redacted]');
+  return out;
+}
+
 async function saveDebugBundle(page, meta) {
   try {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dir = path.join(DEBUG_ROOT, stamp);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(DEBUG_ROOT, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const screenshot = path.join(dir, 'screenshot.png');
     const htmlPath = path.join(dir, 'page.html');
     const errPath = path.join(dir, 'error.json');
     const runtimePath = path.join(dir, 'runtime.json');
     if (page) {
       await page.screenshot({ path: screenshot, fullPage: true }).catch(() => {});
-      const html = await page.content().catch(() => '');
-      fs.writeFileSync(htmlPath, html, 'utf8');
+      const html = scrubHtml(await page.content().catch(() => ''));
+      fs.writeFileSync(htmlPath, html, { encoding: 'utf8', mode: 0o600 });
     }
     const runtime = {
       version: PKG_VERSION,
@@ -593,8 +685,8 @@ async function saveDebugBundle(page, meta) {
       timestamp: new Date().toISOString(),
       ...meta,
     };
-    fs.writeFileSync(errPath, JSON.stringify(runtime, null, 2), 'utf8');
-    fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2), 'utf8');
+    fs.writeFileSync(errPath, JSON.stringify(runtime, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2), { encoding: 'utf8', mode: 0o600 });
     return dir;
   } catch {
     return null;
@@ -813,7 +905,26 @@ async function cmdAsk(argv) {
     flags.has('headed') || process.env.ASK_GPT_HEADED === '1' || process.env.ASK_GPT_HEADED === 'true';
   const headless = flags.has('headless') ? true : !headed;
   const reuse = flags.has('reuse');
-  const useLock = !flags.has('no-lock');
+  const wantNoLock = flags.has('no-lock');
+  const useLock = !wantNoLock;
+  if (wantNoLock) {
+    if (process.env.ASK_GPT_ALLOW_NO_LOCK !== '1') {
+      writeOutcome(
+        failResult(
+          'NO_LOCK_DENIED',
+          '--no-lock can corrupt the shared browser profile',
+          {
+            hint: 'Set ASK_GPT_ALLOW_NO_LOCK=1 if you really mean it (not recommended).',
+          }
+        ),
+        format
+      );
+      return 1;
+    }
+    process.stderr.write(
+      'WARNING: running with --no-lock; concurrent use of the same profile can corrupt cookies/session.\n'
+    );
+  }
   const requestId = crypto.randomBytes(8).toString('hex');
   const promptFingerprint = crypto.createHash('sha256').update(question).digest('hex').slice(0, 16);
 
@@ -1147,11 +1258,14 @@ Defaults:
 Exit codes:
   0 ok | 1 UI_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
 
-Safety (1.0.5+):
-  temporary mode is runtime-verified before send (SESSION_MODE_UNKNOWN)
+Safety (1.0.6+):
+  temporary mode requires temporary-chat URL AND no /c/<id> before send
   --resume verifies URL conversation id (CONVERSATION_MISMATCH)
-  named --saved/--resume hold a per-topic lock
-  secret scan runs before send
+  named --saved/--resume hold a per-topic lock (owner.json)
+  --no-lock requires ASK_GPT_ALLOW_NO_LOCK=1
+  conversations.json written atomically (tmp+rename)
+  debug bundles scrubbed + mode 0700/0600
+  user selectors.json merges with defaults (does not replace)
 
 Runtime:
   ~/.ask-gpt/{browser-profile,runtime.lock,conversations.json,selectors.json,debug/}
