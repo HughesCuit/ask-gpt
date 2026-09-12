@@ -445,45 +445,45 @@ function hashText(t) {
   return crypto.createHash('sha256').update(t || '').digest('hex');
 }
 
-async function waitAndCaptureReply(page, timeout, { baselineHash = null } = {}) {
+async function waitAndCaptureReply(page, timeout, { baselineHash = null, baselineCount = null } = {}) {
   const started = Date.now();
-  const baseline = (await assistantMessages(page)).length;
+  const startCount = baselineCount ?? (await assistantMessages(page)).length;
   let lastText = '';
   let lastHash = baselineHash;
   let stable = 0;
-  let sawContent = false;
-  let sawNewHash = !baselineHash;
+  let sawNewTurn = false;
 
   while (Date.now() - started < timeout) {
     const msgs = await assistantMessages(page);
     const current = msgs.length ? msgs[msgs.length - 1] : '';
     const streaming = await isStreaming(page);
+    const count = msgs.length;
+
+    // New turn if assistant message count grew, or last text changed vs previous observation.
+    if (count > startCount) sawNewTurn = true;
 
     if (current && current !== lastText) {
       lastText = current;
-      sawContent = true;
       stable = 0;
       const h = hashText(current);
-      if (!baselineHash || h !== baselineHash) sawNewHash = true;
+      if (!baselineHash || h !== baselineHash) sawNewTurn = true;
+      // Text change even with same hash edge is rare; still mark if count grew.
       lastHash = h;
     } else if (current) {
       stable += 1;
     }
 
-    const isNewTurn = msgs.length > baseline || sawContent;
-    if (isNewTurn && lastText && sawNewHash && !streaming && stable >= STABLE_TICKS) {
+    if (sawNewTurn && lastText && !streaming && stable >= STABLE_TICKS) {
       return { text: lastText, hash: lastHash || hashText(lastText), truncated: false };
     }
     await page.waitForTimeout(TICK_MS);
   }
 
-  // On timeout: only accept text if streaming has stopped and content looks stable.
   const stillStreaming = await isStreaming(page);
-  if (lastText && (sawNewHash || !baselineHash) && !stillStreaming && stable >= 2) {
+  if (lastText && sawNewTurn && !stillStreaming && stable >= 2) {
     return { text: lastText, hash: lastHash || hashText(lastText), truncated: false };
   }
-  if (lastText && (sawNewHash || !baselineHash)) {
-    // Partial / possibly still streaming — flag as truncated, caller may still use it.
+  if (lastText && sawNewTurn) {
     return { text: lastText, hash: lastHash || hashText(lastText), truncated: true };
   }
   return null;
@@ -853,7 +853,17 @@ async function resolveQuestion(argv) {
 
 /* -------------------- commands -------------------- */
 
+async function withProfileLock(fn, waitMs = DEFAULT_LOCK_WAIT) {
+  const release = await acquireLock(waitMs);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 async function cmdLogin(format) {
+  return withProfileLock(async () => {
   const context = await launch({ headed: true });
   try {
     const page = await context.newPage();
@@ -884,9 +894,11 @@ async function cmdLogin(format) {
   } finally {
     await context.close().catch(() => {});
   }
+  });
 }
 
 async function cmdStatus(format) {
+  return withProfileLock(async () => {
   const context = await launch({ headed: false });
   try {
     const page = await openReusablePage(context);
@@ -919,24 +931,27 @@ async function cmdStatus(format) {
   } finally {
     await context.close().catch(() => {});
   }
+  });
 }
 
 async function cmdHealth(format) {
+  return withProfileLock(async () => {
   const started = Date.now();
   const context = await launch({ headed: false });
   try {
     const page = await openIsolatedPage(context);
     const loggedOut = await isLoggedOut(page);
     const composer = await findComposer(page, 8_000);
+    const temp = composer ? await assertTemporaryChat(page, { timeoutMs: 3000 }) : { ok: false };
     const latency = Date.now() - started;
     const body = visibleText(await page.locator('body').innerText().catch(() => ''));
     const challenge = /cloudflare|checking your browser|just a moment/i.test(body);
     const result = {
-      ok: !!composer && !loggedOut && !challenge,
+      ok: !!composer && !loggedOut && !challenge && !!temp.ok,
       logged_in: loggedOut ? false : !!composer,
       composer_found: !!composer,
       challenge,
-      temporary_chat_ok: !!composer,
+      temporary_chat_ok: !!temp.ok,
       latency_ms: latency,
       profile: PROFILE_DIR,
       selectors_version: SEL.version,
@@ -953,6 +968,7 @@ async function cmdHealth(format) {
   } finally {
     await context.close().catch(() => {});
   }
+  });
 }
 
 async function cmdAsk(argv) {
@@ -1025,16 +1041,17 @@ async function cmdAsk(argv) {
 
   let release = null;
   let releaseConv = null;
-  if (useLock) {
-    release = await acquireLock(waitLock ?? DEFAULT_LOCK_WAIT);
-  }
-  if (wantSaved && conversationName) {
-    releaseConv = await acquireConversationLock(conversationName, waitLock ?? DEFAULT_LOCK_WAIT);
-  }
-
-  const context = await launch({ headed: !headless });
-  let page = null;
+  let context = null;
   try {
+    if (useLock) {
+      release = await acquireLock(waitLock ?? DEFAULT_LOCK_WAIT);
+    }
+    if (wantSaved && conversationName) {
+      releaseConv = await acquireConversationLock(conversationName, waitLock ?? DEFAULT_LOCK_WAIT);
+    }
+
+    context = await launch({ headed: !headless });
+    let page = null;
     if (reuse) page = await openReusablePage(context);
     else if (wantSaved) page = await openSavedPage(context, { conversationId });
     else page = await openIsolatedPage(context);
@@ -1214,7 +1231,10 @@ async function cmdAsk(argv) {
       return 1;
     }
 
-    const reply = await waitAndCaptureReply(page, REPLY_TIMEOUT, { baselineHash });
+    const reply = await waitAndCaptureReply(page, REPLY_TIMEOUT, {
+      baselineHash,
+      baselineCount: preMsgs.length,
+    });
     const durationMs = Date.now() - started;
 
     if (!reply || !reply.text) {
@@ -1329,14 +1349,16 @@ async function cmdDoctor(format) {
   }
 
   if (checks.playwright_core.ok && checks.browser_channel.ok) {
-    const context = await launch({ headed: false });
-    try {
-      const page = await openReusablePage(context);
-      checks.login.status = (await isLoggedOut(page)) ? 'NEED_LOGIN' : 'LOGGED_IN';
-      checks.login.ok = checks.login.status === 'LOGGED_IN';
-    } finally {
-      await context.close().catch(() => {});
-    }
+    await withProfileLock(async () => {
+      const context = await launch({ headed: false });
+      try {
+        const page = await openReusablePage(context);
+        checks.login.status = (await isLoggedOut(page)) ? 'NEED_LOGIN' : 'LOGGED_IN';
+        checks.login.ok = checks.login.status === 'LOGGED_IN';
+      } finally {
+        await context.close().catch(() => {});
+      }
+    });
   } else {
     checks.login.detail = 'skipped (missing playwright-core or browser)';
   }
