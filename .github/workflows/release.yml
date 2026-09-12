@@ -39,10 +39,35 @@ jobs:
             exit 1
           fi
 
-      - name: Pack smoke test
+      - name: Pack smoke test + assert tarball contents
         run: |
           npm pack
           TARBALL=$(ls gpt-web-bridge-*.tgz | head -1)
+          echo "Packed $TARBALL"
+          LISTING=$(tar -tzf "$TARBALL")
+          echo "$LISTING"
+          require() {
+            echo "$LISTING" | grep -E "$1" >/dev/null || {
+              echo "MISSING from tarball: $1" >&2
+              exit 1
+            }
+          }
+          # npm pack paths are package/<file>
+          require '^package/SKILL\.md$'
+          require '^package/bin/web-gpt\.js$'
+          require '^package/src/cli\.mjs$'
+          require '^package/src/thinking-state\.mjs$'
+          require '^package/selectors\.json$'
+          require '^package/package\.json$'
+          require '^package/README\.md$'
+          require '^package/LICENSE$'
+          # Extract and assert bin shebang + package name
+          tar -xzf "$TARBALL" -C /tmp
+          head -1 /tmp/package/bin/web-gpt.js | grep -q '#!/usr/bin/env node' || {
+            echo 'bin/web-gpt.js missing node shebang' >&2
+            exit 1
+          }
+          node -e "const p=require('/tmp/package/package.json'); if(p.name!=='gpt-web-bridge') process.exit(1)"
           mkdir -p /tmp/gpt-web-bridge-smoke
           npm install -g "./$TARBALL"
           gpt-web-bridge --version
