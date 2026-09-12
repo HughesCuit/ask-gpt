@@ -1,6 +1,6 @@
 {
   "name": "gpt-web-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Unofficial browser bridge to a logged-in ChatGPT web session for coding agents. Temporary chats, JSON output, profile lock, debug bundles.",
   "type": "module",
   "bin": {
@@ -39,12 +39,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HughesCuit/ask-gpt.git"
+    "url": "git+https://github.com/HughesCuit/gpt-web-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/HughesCuit/ask-gpt/issues"
+    "url": "https://github.com/HughesCuit/gpt-web-bridge/issues"
   },
-  "homepage": "https://github.com/HughesCuit/ask-gpt#readme",
+  "homepage": "https://github.com/HughesCuit/gpt-web-bridge#readme",
   "dependencies": {
     "playwright-core": "^1.49.0"
   }
