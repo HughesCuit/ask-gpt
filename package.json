@@ -1,10 +1,11 @@
 {
-  "name": "@richardhughes/ask-gpt",
-  "version": "1.0.2",
+  "name": "web-gpt",
+  "version": "1.0.0",
   "description": "Unofficial browser bridge to a logged-in ChatGPT web session for coding agents. Temporary chats, JSON output, profile lock, debug bundles.",
   "type": "module",
   "bin": {
-    "ask-gpt": "bin/ask-gpt.js"
+    "web-gpt": "bin/web-gpt.js",
+    "ask-gpt": "bin/web-gpt.js"
   },
   "files": [
     "bin",
@@ -23,6 +24,7 @@
   "keywords": [
     "chatgpt",
     "openai",
+    "web-gpt",
     "coding-agent",
     "browser-automation",
     "playwright",
@@ -44,4 +46,3 @@
     "playwright-core": "^1.49.0"
   }
 }
-
