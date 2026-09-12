@@ -54,6 +54,7 @@ const TEMP_URL =
 const DEFAULT_TIMEOUT = Number(process.env.ASK_GPT_TIMEOUT_MS || 180_000);
 const NAV_TIMEOUT = Number(process.env.ASK_GPT_NAV_TIMEOUT_MS || 60_000);
 const COMPOSER_TIMEOUT = Number(process.env.ASK_GPT_COMPOSER_TIMEOUT_MS || 25_000);
+const REPLY_TIMEOUT = Number(process.env.ASK_GPT_REPLY_TIMEOUT_MS || DEFAULT_TIMEOUT);
 const STABLE_TICKS = Number(process.env.ASK_GPT_STABLE_TICKS || 3);
 const TICK_MS = Number(process.env.ASK_GPT_TICK_MS || 1000);
 const DEFAULT_LOCK_WAIT = Number(process.env.ASK_GPT_LOCK_WAIT_MS || 60_000);
@@ -163,7 +164,6 @@ function writeLockMeta(lockPath) {
   const meta = {
     pid: process.pid,
     started_at: Date.now(),
-    // Best-effort process start fingerprint to reduce PID-reuse false "alive".
     proc_uptime_s: Math.round(process.uptime()),
     hostname: os.hostname(),
     owner_token: crypto.randomBytes(16).toString('hex'),
@@ -183,7 +183,6 @@ function processAlive(pid) {
   }
 }
 
-/** Stale if pid dead, hostname mismatch, or lock older than 2h. */
 function lockIsStale(lockPath) {
   const meta = readLockMeta(lockPath);
   if (!meta || !meta.pid) {
@@ -197,17 +196,22 @@ function lockIsStale(lockPath) {
   }
   if (!processAlive(meta.pid)) return true;
   if (meta.hostname && meta.hostname !== os.hostname()) return true;
-  // If lock holder claims long uptime but started_at is recent, treat as suspicious only after 2h.
-  const age = Date.now() - Number(meta.started_at || 0);
-  if (age > 2 * 60 * 60 * 1000) return true;
-  // PID reuse heuristic: process alive but its uptime is much younger than lock age.
-  if (meta.pid === process.pid) return false;
-  try {
-    // Cannot read other process uptime portably; rely on hostname + age.
-  } catch {
-    /* ignore */
-  }
+  // Do NOT force-stale solely on age while the owner process is alive.
   return false;
+}
+
+/** Only delete lock if we still own it (owner_token match). */
+function releaseLockOwned(lockPath, ownerToken) {
+  try {
+    const meta = readLockMeta(lockPath);
+    if (!meta || !ownerToken || meta.owner_token !== ownerToken) {
+      return false;
+    }
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function failLockTimeout(code, message) {
@@ -229,14 +233,8 @@ async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR);
-      writeLockMeta(LOCK_DIR);
-      return () => {
-        try {
-          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-      };
+      const meta = writeLockMeta(LOCK_DIR);
+      return () => releaseLockOwned(LOCK_DIR, meta.owner_token);
     } catch {
       if (lockIsStale(LOCK_DIR)) {
         try {
@@ -328,19 +326,28 @@ async function findComposer(page, timeout = 20_000) {
         try {
           const score = await loc.evaluate((el) => {
             let s = 0;
+            let semantic = false;
             const style = window.getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden') return 0;
             if (el.classList && el.classList.contains('fallbackTextarea')) return 0;
             const rect = el.getBoundingClientRect();
             if (rect.width < 80 || rect.height < 20) return 0;
-            s += 20; // visible + size
+            s += 20;
             if (el.isContentEditable) s += 30;
             else if (el.tagName === 'TEXTAREA' && !el.disabled && !el.readOnly) s += 25;
             else return 0;
             const aria = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('placeholder') || '');
-            if (/chat|message|prompt|聊天|输入/i.test(aria)) s += 20;
-            if (el.id === 'prompt-textarea') s += 20;
+            if (/chat|message|prompt|聊天|输入/i.test(aria)) {
+              s += 20;
+              semantic = true;
+            }
+            if (el.id === 'prompt-textarea') {
+              s += 20;
+              semantic = true;
+            }
             if (rect.width > 200 && rect.height > 24) s += 10;
+            // Require either semantic match or large primary editor surface.
+            if (!semantic && !(el.isContentEditable && rect.width > 400 && rect.height > 40)) return 0;
             return s;
           });
           if (score > bestScore) {
@@ -358,6 +365,17 @@ async function findComposer(page, timeout = 20_000) {
   return null;
 }
 
+async function readComposerText(composer) {
+  return (
+    (await composer
+      .evaluate((el) => {
+        if (el.isContentEditable) return el.innerText || el.textContent || '';
+        return el.value || '';
+      })
+      .catch(() => '')) || ''
+  );
+}
+
 async function fillComposer(page, composer, text) {
   await composer.click({ timeout: 10_000, force: true }).catch(() => {});
   await page.waitForTimeout(150);
@@ -365,14 +383,7 @@ async function fillComposer(page, composer, text) {
   await page.keyboard.press('Backspace').catch(() => {});
   await page.keyboard.insertText(text);
   await page.waitForTimeout(200);
-  const content =
-    (await composer
-      .evaluate((el) => {
-        if (el.isContentEditable) return el.innerText || el.textContent || '';
-        return el.value || '';
-      })
-      .catch(() => '')) || '';
-  return content.trim().length > 0;
+  return visibleText(await readComposerText(composer)).length > 0;
 }
 
 async function findSendButton(page) {
@@ -612,14 +623,8 @@ async function acquireConversationLock(name, waitMs = 30_000) {
     try {
       fs.mkdirSync(RUNTIME_ROOT, { recursive: true, mode: 0o700 });
       fs.mkdirSync(lockPath);
-      writeLockMeta(lockPath);
-      return () => {
-        try {
-          fs.rmSync(lockPath, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-      };
+      const meta = writeLockMeta(lockPath);
+      return () => releaseLockOwned(lockPath, meta.owner_token);
     } catch {
       if (lockIsStale(lockPath)) {
         try {
@@ -1109,7 +1114,7 @@ async function cmdAsk(argv) {
       return 1;
     }
 
-    const filled = await fillComposer(page, composer, question);
+    let filled = await fillComposer(page, composer, question);
     if (!filled) {
       await composer.evaluate((el, text) => {
         el.focus();
@@ -1121,6 +1126,20 @@ async function cmdAsk(argv) {
           el.dispatchEvent(new Event('input', { bubbles: true }));
         }
       }, question);
+      await page.waitForTimeout(200);
+      filled = visibleText(await readComposerText(composer)).length > 0;
+    }
+    if (!filled) {
+      const debugDir = await saveDebugBundle(page, { code: 'UI_ERROR', stage: 'fill' });
+      writeOutcome(
+        failResult('UI_ERROR', 'Failed to fill composer', {
+          stage: 'fill',
+          debug_dir: debugDir,
+          retryable: true,
+        }),
+        format
+      );
+      return 1;
     }
 
     await page.waitForTimeout(200);
@@ -1130,19 +1149,37 @@ async function cmdAsk(argv) {
     const preMsgs = await assistantMessages(page);
     const baselineHash = preMsgs.length ? hashText(preMsgs[preMsgs.length - 1]) : null;
 
+    let sent = false;
     const send = await findSendButton(page);
     if (send) {
       try {
         await send.click({ timeout: 3000 });
+        sent = true;
       } catch {
-        await send.click({ timeout: 2000, force: true }).catch(() => {});
-        await page.keyboard.press('Enter').catch(() => {});
+        await send.click({ timeout: 2000, force: true }).then(() => {
+          sent = true;
+        }).catch(() => {});
       }
-    } else {
-      await page.keyboard.press('Enter');
+    }
+    if (!sent) {
+      await page.keyboard.press('Enter').then(() => {
+        sent = true;
+      }).catch(() => {});
+    }
+    if (!sent) {
+      const debugDir = await saveDebugBundle(page, { code: 'SEND_ERROR', stage: 'send' });
+      writeOutcome(
+        failResult('SEND_ERROR', 'Could not submit the message (click/Enter failed)', {
+          stage: 'send',
+          debug_dir: debugDir,
+          retryable: true,
+        }),
+        format
+      );
+      return 1;
     }
 
-    const reply = await waitAndCaptureReply(page, DEFAULT_TIMEOUT, { baselineHash });
+    const reply = await waitAndCaptureReply(page, REPLY_TIMEOUT, { baselineHash });
     const durationMs = Date.now() - started;
 
     if (!reply || !reply.text) {
@@ -1311,19 +1348,16 @@ Defaults:
   dedicated profile at ~/.ask-gpt/browser-profile
 
 Exit codes:
-  0 ok | 1 UI_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
+  0 ok | 1 UI_ERROR/SEND_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
 
-Safety (1.0.7+):
+Safety (1.0.9+):
   temporary mode requires temporary-chat URL AND no /c/<id> before send
-  --resume verifies URL conversation id (CONVERSATION_MISMATCH)
-  named --saved/--resume hold a per-topic lock (owner.json)
+  lock release checks owner_token (no delete-new-owner race)
   --no-lock requires ASK_GPT_ALLOW_NO_LOCK=1
-  conversations.json written atomically (tmp+rename)
-  debug bundles scrubbed + mode 0700/0600
-  user selectors.json merges with defaults
-  composer selected by score; reply hash avoids stale capture
-  SECRET_DETECTED includes matched[] details
-  timeouts: nav/composer/reply (ASK_GPT_*_TIMEOUT_MS)
+  fill verified before send; send failure is SEND_ERROR (not TIMEOUT)
+  reply uses ASK_GPT_REPLY_TIMEOUT_MS; meta.reply_hash avoids stale capture
+  SECRET_DETECTED includes matched[]
+  debug scrubbed 0700/0600; conversations.json atomic
 
 Runtime:
   ~/.ask-gpt/{browser-profile,runtime.lock,conversations.json,selectors.json,debug/}
