@@ -52,6 +52,8 @@ const BASE_URL = process.env.ASK_GPT_URL || 'https://chatgpt.com/';
 const TEMP_URL =
   process.env.ASK_GPT_TEMP_URL || 'https://chatgpt.com/?temporary-chat=true';
 const DEFAULT_TIMEOUT = Number(process.env.ASK_GPT_TIMEOUT_MS || 180_000);
+const NAV_TIMEOUT = Number(process.env.ASK_GPT_NAV_TIMEOUT_MS || 60_000);
+const COMPOSER_TIMEOUT = Number(process.env.ASK_GPT_COMPOSER_TIMEOUT_MS || 25_000);
 const STABLE_TICKS = Number(process.env.ASK_GPT_STABLE_TICKS || 3);
 const TICK_MS = Number(process.env.ASK_GPT_TICK_MS || 1000);
 const DEFAULT_LOCK_WAIT = Number(process.env.ASK_GPT_LOCK_WAIT_MS || 60_000);
@@ -161,6 +163,9 @@ function writeLockMeta(lockPath) {
   const meta = {
     pid: process.pid,
     started_at: Date.now(),
+    // Best-effort process start fingerprint to reduce PID-reuse false "alive".
+    proc_uptime_s: Math.round(process.uptime()),
+    hostname: os.hostname(),
     owner_token: crypto.randomBytes(16).toString('hex'),
     version: PKG_VERSION,
   };
@@ -178,11 +183,10 @@ function processAlive(pid) {
   }
 }
 
-/** Stale if pid dead OR owner.json missing/corrupt OR lock older than 2h with dead-ish owner. */
+/** Stale if pid dead, hostname mismatch, or lock older than 2h. */
 function lockIsStale(lockPath) {
   const meta = readLockMeta(lockPath);
   if (!meta || !meta.pid) {
-    // Legacy pid-only lock or corrupt: treat as stale if pid file missing or process dead.
     try {
       const pid = Number(fs.readFileSync(path.join(lockPath, 'pid'), 'utf8').trim());
       if (!pid) return true;
@@ -192,9 +196,17 @@ function lockIsStale(lockPath) {
     }
   }
   if (!processAlive(meta.pid)) return true;
-  // PID reuse guard: if lock claims to be old but process is "alive", also require recent started_at.
+  if (meta.hostname && meta.hostname !== os.hostname()) return true;
+  // If lock holder claims long uptime but started_at is recent, treat as suspicious only after 2h.
   const age = Date.now() - Number(meta.started_at || 0);
   if (age > 2 * 60 * 60 * 1000) return true;
+  // PID reuse heuristic: process alive but its uptime is much younger than lock age.
+  if (meta.pid === process.pid) return false;
+  try {
+    // Cannot read other process uptime portably; rely on hostname + age.
+  } catch {
+    /* ignore */
+  }
   return false;
 }
 
@@ -248,28 +260,29 @@ async function acquireLock(waitMs = DEFAULT_LOCK_WAIT) {
 /* -------------------- secrets -------------------- */
 
 function scanSecrets(text) {
-  const patterns = [
-    /sk-[A-Za-z0-9]{20,}/,
-    /ghp_[A-Za-z0-9]{20,}/,
-    /github_pat_[A-Za-z0-9_]{20,}/,
-    /AKIA[0-9A-Z]{16}/,
-    /-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/,
-    /xox[baprs]-[A-Za-z0-9-]{10,}/,
-    /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  const matches = [];
+  const named = [
+    ['openai_key', /sk-[A-Za-z0-9]{20,}/],
+    ['github_token', /ghp_[A-Za-z0-9]{20,}/],
+    ['github_pat', /github_pat_[A-Za-z0-9_]{20,}/],
+    ['aws_key', /AKIA[0-9A-Z]{16}/],
+    ['private_key', /-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/],
+    ['slack_token', /xox[baprs]-[A-Za-z0-9-]{10,}/],
+    ['jwt', /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/],
   ];
-  if (patterns.some((re) => re.test(text))) return true;
-  // key=value secrets — require a value that looks like a credential, not source code.
-  const kv =
-    /(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['"]?([^\s'"]{16,})/i;
+  for (const [type, re] of named) {
+    const m = text.match(re);
+    if (m) matches.push({ type, sample: m[0].slice(0, 24) + '…', index: m.index });
+  }
+  const kv = /(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*['"]?([^\s'"]{16,})/i;
   const m = text.match(kv);
   if (m) {
     const val = m[1] || '';
-    // Ignore obvious code / API surface (crypto.randomBytes, process.env, etc.)
     if (!/^(crypto|process|require|import|fs|path|Buffer|JSON|toString|randomBytes)/i.test(val)) {
-      return true;
+      matches.push({ type: 'key_value_secret', sample: (m[0] || '').slice(0, 40) + '…', index: m.index });
     }
   }
-  return false;
+  return { ok: matches.length === 0, matches };
 }
 
 /* -------------------- browser -------------------- */
@@ -306,29 +319,40 @@ async function findComposer(page, timeout = 20_000) {
   const deadline = Date.now() + timeout;
   const selectors = selList('composer');
   while (Date.now() < deadline) {
+    let best = null;
+    let bestScore = 0;
     for (const sel of selectors) {
       const count = await page.locator(sel).count().catch(() => 0);
       for (let i = 0; i < count; i++) {
         const loc = page.locator(sel).nth(i);
         try {
-          const ok = await loc.evaluate((el) => {
+          const score = await loc.evaluate((el) => {
+            let s = 0;
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return false;
-            if (el.classList && el.classList.contains('fallbackTextarea')) return false;
+            if (style.display === 'none' || style.visibility === 'hidden') return 0;
+            if (el.classList && el.classList.contains('fallbackTextarea')) return 0;
             const rect = el.getBoundingClientRect();
-            if (rect.width < 80 || rect.height < 20) return false;
-            if (el.isContentEditable) return true;
-            if (el.tagName === 'TEXTAREA') {
-              return !el.disabled && !el.readOnly && el.offsetParent !== null;
-            }
-            return false;
+            if (rect.width < 80 || rect.height < 20) return 0;
+            s += 20; // visible + size
+            if (el.isContentEditable) s += 30;
+            else if (el.tagName === 'TEXTAREA' && !el.disabled && !el.readOnly) s += 25;
+            else return 0;
+            const aria = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('placeholder') || '');
+            if (/chat|message|prompt|聊天|输入/i.test(aria)) s += 20;
+            if (el.id === 'prompt-textarea') s += 20;
+            if (rect.width > 200 && rect.height > 24) s += 10;
+            return s;
           });
-          if (ok) return loc;
+          if (score > bestScore) {
+            bestScore = score;
+            best = loc;
+          }
         } catch {
           /* keep trying */
         }
       }
     }
+    if (best && bestScore >= 50) return best;
     await page.waitForTimeout(300);
   }
   return null;
@@ -396,12 +420,18 @@ async function isStreaming(page) {
   return false;
 }
 
-async function waitAndCaptureReply(page, timeout) {
+function hashText(t) {
+  return crypto.createHash('sha256').update(t || '').digest('hex');
+}
+
+async function waitAndCaptureReply(page, timeout, { baselineHash = null } = {}) {
   const started = Date.now();
   const baseline = (await assistantMessages(page)).length;
   let lastText = '';
+  let lastHash = baselineHash;
   let stable = 0;
   let sawContent = false;
+  let sawNewHash = !baselineHash;
 
   while (Date.now() - started < timeout) {
     const msgs = await assistantMessages(page);
@@ -412,17 +442,24 @@ async function waitAndCaptureReply(page, timeout) {
       lastText = current;
       sawContent = true;
       stable = 0;
+      const h = hashText(current);
+      if (!baselineHash || h !== baselineHash) sawNewHash = true;
+      lastHash = h;
     } else if (current) {
       stable += 1;
     }
 
     const isNewTurn = msgs.length > baseline || sawContent;
-    if (isNewTurn && lastText && !streaming && stable >= STABLE_TICKS) {
-      return lastText;
+    // Require hash change when a pre-send assistant message existed (avoid returning stale reply).
+    if (isNewTurn && lastText && sawNewHash && !streaming && stable >= STABLE_TICKS) {
+      return { text: lastText, hash: lastHash || hashText(lastText) };
     }
     await page.waitForTimeout(TICK_MS);
   }
-  return lastText || null;
+  if (lastText && (sawNewHash || !baselineHash)) {
+    return { text: lastText, hash: lastHash || hashText(lastText) };
+  }
+  return null;
 }
 
 async function dismissOverlays(page) {
@@ -449,7 +486,7 @@ async function dismissOverlays(page) {
 
 async function openIsolatedPage(context) {
   const page = await context.newPage();
-  await page.goto(TEMP_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await page.goto(TEMP_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
   await page.waitForTimeout(3000);
   await dismissOverlays(page);
   await page.waitForTimeout(500);
@@ -522,7 +559,7 @@ async function verifyConversationOwnership(page, expectedId, { timeoutMs = 10000
 async function openSavedPage(context, { conversationId = null } = {}) {
   const page = await context.newPage();
   const url = conversationId ? `https://chatgpt.com/c/${conversationId}` : BASE_URL;
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
   await page.waitForTimeout(3000);
   await dismissOverlays(page);
   await page.waitForTimeout(500);
@@ -902,10 +939,12 @@ async function cmdAsk(argv) {
   const { question, flags, format: fmtArg, waitLock, name, resume } = await resolveQuestion(argv);
   const format = fmtArg || (process.env.ASK_GPT_FORMAT === 'json' ? 'json' : 'text');
 
-  if (scanSecrets(question)) {
+  const secretScan = scanSecrets(question);
+  if (!secretScan.ok) {
     writeOutcome(
       failResult('SECRET_DETECTED', 'Prompt looks like it contains a secret/key', {
         hint: 'Redact credentials before asking ChatGPT.',
+        matched: secretScan.matches,
       }),
       format
     );
@@ -1044,7 +1083,7 @@ async function cmdAsk(argv) {
       }
     }
 
-    const composer = await findComposer(page, 25_000);
+    const composer = await findComposer(page, COMPOSER_TIMEOUT);
     if (!composer) {
       const body = visibleText(await page.locator('body').innerText().catch(() => ''));
       if (/cloudflare|checking your browser|just a moment/i.test(body)) {
@@ -1087,6 +1126,10 @@ async function cmdAsk(argv) {
     await page.waitForTimeout(200);
     await dismissOverlays(page);
 
+    // Snapshot last assistant message hash so we do not return a stale reply.
+    const preMsgs = await assistantMessages(page);
+    const baselineHash = preMsgs.length ? hashText(preMsgs[preMsgs.length - 1]) : null;
+
     const send = await findSendButton(page);
     if (send) {
       try {
@@ -1099,10 +1142,10 @@ async function cmdAsk(argv) {
       await page.keyboard.press('Enter');
     }
 
-    const reply = await waitAndCaptureReply(page, DEFAULT_TIMEOUT);
+    const reply = await waitAndCaptureReply(page, DEFAULT_TIMEOUT, { baselineHash });
     const durationMs = Date.now() - started;
 
-    if (!reply) {
+    if (!reply || !reply.text) {
       const debugDir = await saveDebugBundle(page, { code: 'TIMEOUT', stage: 'reply' });
       writeOutcome(
         failResult('TIMEOUT', 'No assistant reply captured', {
@@ -1129,9 +1172,10 @@ async function cmdAsk(argv) {
     }
 
     writeOutcome(
-      okResult(reply, {
+      okResult(reply.text, {
         request_id: requestId,
         prompt_fingerprint: promptFingerprint,
+        reply_hash: reply.hash,
         duration_ms: durationMs,
         conversation: mode,
         conversation_id: convId,
@@ -1269,14 +1313,17 @@ Defaults:
 Exit codes:
   0 ok | 1 UI_ERROR | 2 NEED_LOGIN | 3 CHALLENGE | 4 TIMEOUT | 5 SECRET_DETECTED | 6 LOCK_TIMEOUT
 
-Safety (1.0.6+):
+Safety (1.0.7+):
   temporary mode requires temporary-chat URL AND no /c/<id> before send
   --resume verifies URL conversation id (CONVERSATION_MISMATCH)
   named --saved/--resume hold a per-topic lock (owner.json)
   --no-lock requires ASK_GPT_ALLOW_NO_LOCK=1
   conversations.json written atomically (tmp+rename)
   debug bundles scrubbed + mode 0700/0600
-  user selectors.json merges with defaults (does not replace)
+  user selectors.json merges with defaults
+  composer selected by score; reply hash avoids stale capture
+  SECRET_DETECTED includes matched[] details
+  timeouts: nav/composer/reply (ASK_GPT_*_TIMEOUT_MS)
 
 Runtime:
   ~/.ask-gpt/{browser-profile,runtime.lock,conversations.json,selectors.json,debug/}
