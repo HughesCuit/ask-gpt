@@ -606,6 +606,71 @@ async function openSavedPage(context, { conversationId = null } = {}) {
   return page;
 }
 
+/**
+ * Best-effort enable ChatGPT "Thinking" / reasoning mode.
+ * Current UI often exposes a composer chip/button labeled 思考 / Thinking.
+ */
+async function enableThinkingMode(page) {
+  try {
+    // 1) DOM scan for composer chip labeled 思考 / Thinking (more reliable than :has-text for CJK)
+    const clicked = await page.evaluate(() => {
+      const nodes = document.querySelectorAll('button, [role="button"]');
+      for (const el of nodes) {
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, '').trim();
+        const aria = el.getAttribute('aria-label') || '';
+        if (!/(思考|thinking|think|reason)/i.test(t) && !/(思考|thinking|think|reason)/i.test(aria)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        el.click();
+        return { text: t.slice(0, 30), aria: aria.slice(0, 40) };
+      }
+      return null;
+    });
+    if (clicked) {
+      await page.waitForTimeout(400);
+      return { ok: true, method: 'dom-click', detail: clicked };
+    }
+
+    // 2) Open model switcher then pick option
+    let trigger = null;
+    for (const sel of selList('thinkingTrigger')) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 250 }).catch(() => false)) {
+        trigger = loc;
+        break;
+      }
+    }
+    if (trigger) {
+      await trigger.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(450);
+    }
+
+    const items = page.locator('[role="menuitem"], [role="option"], [role="menuitemradio"], button');
+    const n = await items.count().catch(() => 0);
+    for (let i = 0; i < Math.min(n, 80); i++) {
+      const t = visibleText(await items.nth(i).innerText().catch(() => ''));
+      if (/think|思考|reason/i.test(t)) {
+        await items.nth(i).click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(300);
+        await page.keyboard.press('Escape').catch(() => {});
+        return { ok: true, method: 'menuitem-text', text: t.slice(0, 30) };
+      }
+    }
+    await page.keyboard.press('Escape').catch(() => {});
+    const btnTexts = await page
+      .evaluate(() =>
+        [...document.querySelectorAll('button, [role="button"]')]
+          .map((b) => (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean)
+          .slice(0, 40)
+      )
+      .catch(() => []);
+    return { ok: false, method: 'option-not-found', buttons: btnTexts };
+  } catch (err) {
+    return { ok: false, method: 'error:' + String(err.message || err).slice(0, 80) };
+  }
+}
+
 function extractConversationId(url) {
   const m = /\/c\/([0-9a-f-]{36})/i.exec(url || '');
   return m ? m[1] : null;
@@ -831,6 +896,7 @@ function parseAskArgs(argv) {
       resume = argv[++i];
       flags.add('saved');
     } else if (a === '--reuse' || a === '--reuse-session') flags.add('reuse');
+    else if (a === '--thinking' || a === '--reason' || a === '--think') flags.add('thinking');
     else if (a === '--headed' || a === '--headless') flags.add(a.slice(2));
     else if (a === '--wait-lock') waitLock = Number(argv[++i]);
     else if (a === '--no-lock') flags.add('no-lock');
@@ -1003,6 +1069,10 @@ async function cmdAsk(argv) {
     flags.has('headed') || process.env.ASK_GPT_HEADED === '1' || process.env.ASK_GPT_HEADED === 'true';
   const headless = flags.has('headless') ? true : !headed;
   const reuse = flags.has('reuse');
+  const wantThinking =
+    flags.has('thinking') ||
+    process.env.ASK_GPT_THINKING === '1' ||
+    process.env.ASK_GPT_THINKING === 'true';
   const wantNoLock = flags.has('no-lock');
   const useLock = !wantNoLock;
   if (wantNoLock) {
@@ -1077,6 +1147,8 @@ async function cmdAsk(argv) {
       );
       return 2;
     }
+
+    let thinking = { ok: false, method: 'not-requested' };
 
     // P0: refuse to send if temporary mode cannot be confirmed
     if (!reuse && !wantSaved) {
@@ -1156,6 +1228,16 @@ async function cmdAsk(argv) {
         format
       );
       return 1;
+    }
+
+    // Enable thinking only after composer is ready (UI fully mounted).
+    if (wantThinking) {
+      thinking = await enableThinkingMode(page);
+      if (!thinking.ok && format === 'text') {
+        process.stderr.write(
+          `warn: could not enable thinking mode (${thinking.method}); continuing anyway\n`
+        );
+      }
     }
 
     let filled = await fillComposer(page, composer, question);
@@ -1280,6 +1362,10 @@ async function cmdAsk(argv) {
         prompt_fingerprint: promptFingerprint,
         reply_hash: reply.hash,
         truncated: !!reply.truncated,
+        thinking_requested: wantThinking,
+        thinking_enabled: !!thinking.ok,
+        thinking_method: thinking.method,
+        thinking_detail: thinking.detail || thinking.buttons || null,
         duration_ms: durationMs,
         conversation: mode,
         conversation_id: convId,
@@ -1403,7 +1489,7 @@ Usage:
   gpt-web-bridge status|health|doctor [--json]
   gpt-web-bridge conversations [--json]
   gpt-web-bridge ask "question" [--json] [--temporary|--saved] [--name topic] [--resume name|id]
-                         [--reuse] [--headed] [--wait-lock ms] [--no-lock]
+                         [--thinking] [--reuse] [--headed] [--wait-lock ms] [--no-lock]
   gpt-web-bridge ask --file path [--json] [--stdin]
 
 Conversation modes:
@@ -1411,6 +1497,7 @@ Conversation modes:
   --saved / --name topic normal ChatGPT chat; can use memory; save id under topic
   --resume name|id       continue a previously named (or /c/<uuid>) conversation
   --reuse                reuse an existing chatgpt.com tab (rare)
+  --thinking             try enable ChatGPT Thinking/reasoning mode (best-effort)
 
 Defaults:
   temporary chat; profile file lock enabled

@@ -36,6 +36,28 @@
     "a:has-text(\"登录\")",
     "[data-testid=\"login-button\"]"
   ],
+  "thinkingTrigger": [
+    "button:has-text(\"思考\")",
+    "button:has-text(\"Thinking\")",
+    "button:has-text(\"Reason\")",
+    "button[data-testid=\"model-switcher-dropdown-button\"]",
+    "button[aria-label*=\"Model\"]",
+    "button[aria-haspopup=\"menu\"][aria-label*=\"model\" i]",
+    "button:has-text(\"ChatGPT\")",
+    "button:has-text(\"Auto\")",
+    "[data-testid=\"composer-model-switcher\"] button"
+  ],
+  "thinkingOption": [
+    "button:has-text(\"思考\")",
+    "button:has-text(\"Thinking\")",
+    "[role=\"menuitem\"]:has-text(\"Thinking\")",
+    "[role=\"menuitem\"]:has-text(\"思考\")",
+    "[role=\"option\"]:has-text(\"Thinking\")",
+    "[role=\"option\"]:has-text(\"思考\")",
+    "[data-testid*=\"thinking\"]",
+    "[aria-label*=\"Thinking\"]",
+    "[aria-label*=\"思考\"]"
+  ],
   "dismiss": [
     "button:has-text(\"Accept all\")",
     "button:has-text(\"全部接受\")",
